@@ -96,6 +96,12 @@ def list_posts(limit: int = 20) -> list:
     Returns:
         List of post objects, or empty list on failure.
     """
+    from utils.toggle import is_dry_run
+    if is_dry_run():
+        from utils.mock_fixtures import MOCK_POSTS
+        logger.info(f"[DRY_RUN] Returning {len(MOCK_POSTS)} mock posts (no Apify call)")
+        return MOCK_POSTS[:limit]
+
     payload = {
         "action": "posts:list",
         "groupSlug": GROUP_SLUG,
@@ -115,6 +121,13 @@ def list_comments(post_id: str) -> list:
     Returns:
         List of comment objects, or empty list on failure.
     """
+    from utils.toggle import is_dry_run
+    if is_dry_run():
+        from utils.mock_fixtures import mock_list_comments
+        comments = mock_list_comments(post_id)
+        logger.info(f"[DRY_RUN] Returning {len(comments)} mock comments for post {post_id}")
+        return comments
+
     payload = {
         "action": "posts:list",
         "groupSlug": GROUP_SLUG,
@@ -135,6 +148,17 @@ def create_post(body: str, category: str = "general") -> bool:
     Returns:
         True if the post was created successfully, False otherwise.
     """
+    from utils.toggle import is_dry_run
+    if is_dry_run():
+        from utils.mock_feed import append_post
+        preview = body[:100].replace("\n", " ")
+        logger.info(
+            f"[DRY_RUN] Would have posted to Skool (category={category}, "
+            f"{len(body)} chars): {preview!r}..."
+        )
+        append_post(body=body, category=category)
+        return True
+
     payload = {
         "action": "posts:create",
         "groupSlug": GROUP_SLUG,
@@ -157,6 +181,21 @@ def create_reply(body: str, root_id: str, parent_id: str) -> bool:
     Returns:
         True if the reply was posted successfully, False otherwise.
     """
+    from utils.toggle import is_dry_run
+    if is_dry_run():
+        from utils.mock_feed import append_reply
+        from utils.user_comments import mark_replied
+        preview = body[:100].replace("\n", " ")
+        logger.info(
+            f"[DRY_RUN] Would have replied to comment {parent_id} "
+            f"(rootId={root_id}, {len(body)} chars): {preview!r}..."
+        )
+        append_reply(body=body, root_id=root_id, parent_id=parent_id)
+        # If this reply targeted a user-submitted comment, flip its
+        # `replied` flag so the next cycle doesn't pick it up again.
+        mark_replied(parent_id)
+        return True
+
     payload = {
         "action": "posts:create",
         "groupSlug": GROUP_SLUG,

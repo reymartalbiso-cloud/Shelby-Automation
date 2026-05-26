@@ -1,3 +1,10 @@
 {
-  "SYSTEM_ACTIVE": true
+  "SYSTEM_ACTIVE": false,
+  "MOCK_CLAUDE": true,
+  "DRY_RUN": true,
+  "TEST_SCHEDULE": {
+    "daily_post_minutes": 3,
+    "comment_reply_minutes": 5,
+    "weekly_events_minutes": 10
+  }
 }

@@ -30,11 +30,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Force UTF-8 on Windows so emoji-containing log lines don't crash on cp1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Load shared modules ──────────────────────────────────────
 from shelby_prompt import SHELBY_SYSTEM_PROMPT
-from utils.toggle import is_system_active
+from utils.toggle import is_system_active, is_dry_run
 from utils.claude_client import generate_content
 from utils.apify_client import list_posts, list_comments, create_reply
+from utils.mock_feed import append_community_comment
 
 # ── Logging Setup ────────────────────────────────────────────
 logging.basicConfig(
@@ -147,6 +152,18 @@ def process_post(post: dict, shelby_user_id: str) -> tuple[int, int]:
 
         # Determine the root post ID for threading the reply correctly
         root_id = comment.get("rootId") or post_id
+
+        # In dry-run mode, record the community comment we're about to reply
+        # to on the mock feed — gives the feed page context.
+        if is_dry_run():
+            author = comment.get("createdBy", {})
+            append_community_comment(
+                body=comment_body,
+                comment_id=comment_id,
+                root_id=root_id,
+                author_name=author.get("name", "Unknown teacher"),
+                author_id=author.get("id", "unknown"),
+            )
 
         # Generate reply with Claude
         prompt = build_reply_prompt(comment_body)

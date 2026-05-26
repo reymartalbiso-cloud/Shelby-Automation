@@ -53,6 +53,20 @@ def generate_content(
     Returns:
         The generated text string, or None if both attempts fail.
     """
+    # Short-circuit: if MOCK_CLAUDE is on in config.json, return a hand-tuned
+    # Shelby-voice fixture instead of hitting the real Anthropic API. This is
+    # how we test for $0 before the client provides a funded API key.
+    from utils.toggle import is_mock_claude
+    from utils.mock_fixtures import select_mock_response
+
+    if is_mock_claude():
+        mock_text = select_mock_response(user_message)
+        logger.info(
+            f"[MOCK_CLAUDE] Returning fixture ({len(mock_text)} chars) — "
+            f"no Anthropic API call made."
+        )
+        return mock_text
+
     api_key = _get_api_key()
 
     headers = {

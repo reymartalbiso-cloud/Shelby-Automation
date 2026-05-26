@@ -25,6 +25,10 @@ from datetime import datetime
 
 import pytz
 
+# Force UTF-8 on Windows so emoji-containing log lines don't crash on cp1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Load shared modules ──────────────────────────────────────
 from shelby_prompt import SHELBY_SYSTEM_PROMPT, DAY_CONTENT_MAP
 from utils.toggle import is_system_active

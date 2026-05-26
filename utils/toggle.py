@@ -16,6 +16,19 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.j
 logger = logging.getLogger(__name__)
 
 
+def _read_config() -> dict:
+    """Reads config.json and returns it as a dict. Returns empty dict on failure."""
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error(f"config.json not found at {CONFIG_PATH}.")
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error(f"config.json is malformed: {e}.")
+        return {}
+
+
 def is_system_active() -> bool:
     """
     Reads SYSTEM_ACTIVE from config.json.
@@ -24,19 +37,29 @@ def is_system_active() -> bool:
         True  — system is on, proceed with workflow
         False — system is paused, exit immediately
     """
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            config = json.load(f)
-        active = config.get("SYSTEM_ACTIVE", False)
-        if not active:
-            logger.info("System is PAUSED (SYSTEM_ACTIVE = false). Exiting.")
-        return bool(active)
-    except FileNotFoundError:
-        logger.error(f"config.json not found at {CONFIG_PATH}. Defaulting to INACTIVE.")
-        return False
-    except json.JSONDecodeError as e:
-        logger.error(f"config.json is malformed: {e}. Defaulting to INACTIVE.")
-        return False
+    config = _read_config()
+    active = config.get("SYSTEM_ACTIVE", False)
+    if not active:
+        logger.info("System is PAUSED (SYSTEM_ACTIVE = false). Exiting.")
+    return bool(active)
+
+
+def is_mock_claude() -> bool:
+    """
+    Reads MOCK_CLAUDE from config.json.
+    When true, claude_client.generate_content returns canned Shelby-voice
+    fixtures instead of calling the real Anthropic API. Useful for $0 testing.
+    """
+    return bool(_read_config().get("MOCK_CLAUDE", False))
+
+
+def is_dry_run() -> bool:
+    """
+    Reads DRY_RUN from config.json.
+    When true, apify_client write functions log what they would have posted
+    and return success without calling Apify. Read functions return mock data.
+    """
+    return bool(_read_config().get("DRY_RUN", False))
 
 
 def set_system_active(value: bool) -> bool:
