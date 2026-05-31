@@ -39,6 +39,37 @@ def _get_token() -> str:
     return token
 
 
+def _get_skool_creds() -> tuple[str, str]:
+    """
+    Reads Shelby's Skool email + password from env. The Apify actor requires
+    these to authenticate against Skool (cookie-based; the actor caches the
+    session internally per run).
+    """
+    email = os.getenv("SKOOL_EMAIL")
+    password = os.getenv("SKOOL_PASSWORD")
+    if not email or not password:
+        raise EnvironmentError(
+            "SKOOL_EMAIL and SKOOL_PASSWORD must be set in .env — the Apify "
+            "Skool actor needs them to log in as Shelby."
+        )
+    return email, password
+
+
+def _is_actor_error(results) -> tuple[bool, str | None]:
+    """
+    Detects an actor-level failure encoded inside a single-item dataset.
+    The cristiantala/skool-all-in-one-api actor reports auth/validation errors
+    as `[{"success": false, "error": "...", ...}]` rather than a non-2xx HTTP
+    code, so the raw HTTP layer can't catch them — we have to inspect the body.
+    """
+    if not isinstance(results, list) or len(results) != 1:
+        return False, None
+    first = results[0]
+    if isinstance(first, dict) and first.get("success") is False:
+        return True, first.get("error") or first.get("errorCode") or "unknown actor error"
+    return False, None
+
+
 def _run_actor(payload: dict) -> list | None:
     """
     Core function that sends a request to the Apify actor.
@@ -50,7 +81,13 @@ def _run_actor(payload: dict) -> list | None:
         A list of result items from Apify, or None on failure.
     """
     token = _get_token()
+    email, password = _get_skool_creds()
     url = f"{APIFY_BASE_URL}?token={token}"
+
+    # Inject Skool auth into every call. The actor caches the session per run,
+    # so we pay the Playwright login cost once per actor invocation, not per
+    # logical action. Done here (not at call sites) so callers stay simple.
+    payload = {**payload, "email": email, "password": password}
 
     for attempt in range(1, MAX_RETRIES + 2):  # 2 total attempts
         try:
@@ -65,6 +102,14 @@ def _run_actor(payload: dict) -> list | None:
             response.raise_for_status()
 
             results = response.json()
+
+            # The actor reports auth/input errors INSIDE the dataset, not via
+            # a non-2xx HTTP. Catch that here so callers never see a fake "OK".
+            errored, err_msg = _is_actor_error(results)
+            if errored:
+                logger.error(f"Apify '{action}' actor-level failure: {err_msg}")
+                return None
+
             logger.info(f"Apify '{action}' success — {len(results)} item(s) returned")
             return results
 
@@ -83,125 +128,126 @@ def _run_actor(payload: dict) -> list | None:
     return None
 
 
+def _write_succeeded(result, action: str) -> bool:
+    """
+    Validates the dataset returned by a write action (posts:create).
+
+    The run-sync-get-dataset-items endpoint returns whatever items the actor
+    pushed. A successful create pushes the created object; a failure typically
+    yields an empty dataset or an item carrying an error field. We treat both
+    as failure — unlike the old `result is not None` check, which counted an
+    empty list `[]` as success and could log "posted" when nothing happened.
+
+    NOTE: confirm the exact created-id field name against the live actor once
+    real credentials are available; the id logging below is best-effort.
+    """
+    if not result or not isinstance(result, list):
+        logger.error(f"Apify '{action}' returned no items — treating as a FAILED write.")
+        return False
+
+    first = result[0]
+    if isinstance(first, dict) and (first.get("error") or first.get("errorMessage")):
+        err = first.get("error") or first.get("errorMessage")
+        logger.error(f"Apify '{action}' reported an error: {err}")
+        return False
+
+    created_id = first.get("id") if isinstance(first, dict) else None
+    if created_id:
+        logger.info(f"Apify '{action}' created id={created_id}")
+    return True
+
+
 # ── Public Functions ─────────────────────────────────────────
+#
+# These wrap the four actions the live actor accepts. Field/action names below
+# were validated by direct calls against cristiantala/skool-all-in-one-api:
+#   posts:list         → flat groupSlug; returns ALL posts (limit ignored, we
+#                        slice client-side after sorting by updatedAt desc)
+#   posts:getComments  → params.postId; comments have nested `replies`
+#   posts:create       → params.title + params.content + params.labelId
+#   posts:createComment→ params.content + params.rootId + params.parentId
+#
+# Real object fields (NOT the spec's assumed names):
+#   author.id     (not createdBy.id)
+#   content       (not body)
+#   rootId, parentId, replies   — as expected
+
+
+# Skool category (label) the daily/weekly post goes into. The class-economy
+# group has three labels; the 24-post default below is the main discussion
+# feed. Override via SKOOL_POST_LABEL_ID in .env if you'd rather route AI
+# posts to a different category.
+DEFAULT_LABEL_ID = "285b3422ba63486b84b3a16f0fce8a5a"
 
 
 def list_posts(limit: int = 20) -> list:
     """
-    Fetches the most recent posts from the class-economy group.
+    Fetches the `limit` most recent posts from the class-economy group.
 
-    Args:
-        limit: How many posts to fetch (default 20).
-
-    Returns:
-        List of post objects, or empty list on failure.
+    The actor doesn't honor a `limit` parameter — it returns all top-level posts
+    — so we sort by `updatedAt` desc and slice client-side.
     """
-    from utils.toggle import is_dry_run
-    if is_dry_run():
-        from utils.mock_fixtures import MOCK_POSTS
-        logger.info(f"[DRY_RUN] Returning {len(MOCK_POSTS)} mock posts (no Apify call)")
-        return MOCK_POSTS[:limit]
-
     payload = {
         "action": "posts:list",
         "groupSlug": GROUP_SLUG,
-        "limit": limit,
     }
     result = _run_actor(payload)
-    return result if result is not None else []
+    if not result:
+        return []
+    # Newest activity first, then truncate.
+    result.sort(key=lambda p: p.get("updatedAt") or p.get("createdAt") or "", reverse=True)
+    return result[:limit]
 
 
 def list_comments(post_id: str) -> list:
     """
-    Fetches all comments/replies for a specific post.
-
-    Args:
-        post_id: The Skool post ID to fetch comments for.
-
-    Returns:
-        List of comment objects, or empty list on failure.
+    Fetches all comments for a specific post. Each comment includes a nested
+    `replies` array of any direct replies (matching the spec's filter logic).
     """
-    from utils.toggle import is_dry_run
-    if is_dry_run():
-        from utils.mock_fixtures import mock_list_comments
-        comments = mock_list_comments(post_id)
-        logger.info(f"[DRY_RUN] Returning {len(comments)} mock comments for post {post_id}")
-        return comments
-
     payload = {
-        "action": "posts:list",
+        "action": "posts:getComments",
         "groupSlug": GROUP_SLUG,
-        "rootId": post_id,
+        "params": {"postId": post_id},
     }
     result = _run_actor(payload)
     return result if result is not None else []
 
 
-def create_post(body: str, category: str = "general") -> bool:
+def create_post(title: str, content: str, label_id: str | None = None) -> bool:
     """
-    Creates a new top-level post in the class-economy Skool community.
+    Creates a new top-level post in the class-economy community.
 
-    Args:
-        body:     The post text content.
-        category: Skool category slug (default "general").
-
-    Returns:
-        True if the post was created successfully, False otherwise.
+    Skool posts require a title AND content; the AI generates the content and
+    the caller derives a short title from it (see daily_post / weekly_events).
     """
-    from utils.toggle import is_dry_run
-    if is_dry_run():
-        from utils.mock_feed import append_post
-        preview = body[:100].replace("\n", " ")
-        logger.info(
-            f"[DRY_RUN] Would have posted to Skool (category={category}, "
-            f"{len(body)} chars): {preview!r}..."
-        )
-        append_post(body=body, category=category)
-        return True
-
     payload = {
         "action": "posts:create",
         "groupSlug": GROUP_SLUG,
-        "body": body,
-        "category": category,
+        "params": {
+            "title": title,
+            "content": content,
+            "labelId": label_id or os.getenv("SKOOL_POST_LABEL_ID") or DEFAULT_LABEL_ID,
+        },
     }
     result = _run_actor(payload)
-    return result is not None
+    return _write_succeeded(result, action="posts:create")
 
 
-def create_reply(body: str, root_id: str, parent_id: str) -> bool:
+def create_reply(content: str, root_id: str, parent_id: str) -> bool:
     """
-    Posts a reply to a specific comment on a Skool post.
+    Posts a reply (comment) to a specific comment under a post.
 
-    Args:
-        body:      The reply text content.
-        root_id:   The ID of the original top-level post.
-        parent_id: The ID of the specific comment being replied to.
-
-    Returns:
-        True if the reply was posted successfully, False otherwise.
+    `root_id` is the original post; `parent_id` is the comment being replied
+    to (for a top-level comment on a post, parent_id == root_id).
     """
-    from utils.toggle import is_dry_run
-    if is_dry_run():
-        from utils.mock_feed import append_reply
-        from utils.user_comments import mark_replied
-        preview = body[:100].replace("\n", " ")
-        logger.info(
-            f"[DRY_RUN] Would have replied to comment {parent_id} "
-            f"(rootId={root_id}, {len(body)} chars): {preview!r}..."
-        )
-        append_reply(body=body, root_id=root_id, parent_id=parent_id)
-        # If this reply targeted a user-submitted comment, flip its
-        # `replied` flag so the next cycle doesn't pick it up again.
-        mark_replied(parent_id)
-        return True
-
     payload = {
-        "action": "posts:create",
+        "action": "posts:createComment",
         "groupSlug": GROUP_SLUG,
-        "body": body,
-        "rootId": root_id,
-        "parentId": parent_id,
+        "params": {
+            "content": content,
+            "rootId": root_id,
+            "parentId": parent_id,
+        },
     }
     result = _run_actor(payload)
-    return result is not None
+    return _write_succeeded(result, action="posts:createComment")

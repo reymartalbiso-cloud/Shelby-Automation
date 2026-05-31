@@ -4,11 +4,16 @@ utils/claude_client.py
 Reusable wrapper for the Anthropic Claude API.
 All content generation in this project goes through this module.
 
-Model: claude-sonnet-4-20250514
+Model: claude-sonnet-4-6
 API docs: https://docs.anthropic.com/en/api/messages
+
+Note: the original client spec named `claude-sonnet-4-20250514`, which Anthropic
+does not publish (the endpoint returns 404 for it). We use the current Sonnet
+4.6 alias instead — the closest in-family substitute.
 """
 
 import os
+import re
 import time
 import logging
 import requests
@@ -20,10 +25,58 @@ logger = logging.getLogger(__name__)
 
 # ── API Config ──────────────────────────────────────────────
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 ANTHROPIC_VERSION = "2023-06-01"
 MAX_RETRIES = 1
 RETRY_DELAY_SECONDS = 5
+
+
+def _sanitize_output(text: str) -> str:
+    """
+    Strip AI-tell formatting from generated content before it goes out.
+
+    Two classes of "tells" are removed here:
+
+    1. Em-dashes (—) and en-dashes (–) — one of the most recognizable signs of
+       AI writing. Replaced with natural punctuation.
+
+    2. Markdown emphasis (**bold**, *italic*, __bold__, `code`) — Skool renders
+       posts as plain text, so these characters show up literally as asterisks
+       and underscores in the feed. We strip the wrappers but keep the inner
+       words intact.
+
+    Even with explicit prompt rules forbidding both, the model occasionally
+    slips. This belt-and-suspenders pass runs on EVERY Claude response so
+    anyone reading the post or reply sees only clean Shelby-voice text.
+    """
+    if not text:
+        return text
+
+    # ---- Dashes ----
+    # Spaced dashes (most common em-dash usage) become a comma + space.
+    text = text.replace(" — ", ", ").replace(" – ", ", ")
+    # Unspaced em-dash (e.g. "word—word") becomes ", ".
+    text = text.replace("—", ", ")
+    # Unspaced en-dash (often number ranges like "7–10") becomes a hyphen.
+    text = text.replace("–", "-")
+
+    # ---- Markdown emphasis ----
+    # Bold first so it's consumed before the italic pass sees a stray `*`.
+    # The inner pattern forbids the wrapper char + newlines so we never span
+    # paragraphs or merge unrelated formatting blocks.
+    text = re.sub(r"\*\*([^*\n]+?)\*\*", r"\1", text)   # **bold**
+    text = re.sub(r"__([^_\n]+?)__", r"\1", text)       # __bold__
+    # Single-asterisk italic. Lookaround keeps us from eating any leftover **.
+    text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"\1", text)
+    # Inline `code` — backticks have no rendering on Skool either.
+    text = re.sub(r"`([^`\n]+?)`", r"\1", text)
+
+    # ---- Tidy up ----
+    while ", ," in text:
+        text = text.replace(", ,", ",")
+    while "  " in text:
+        text = text.replace("  ", " ")
+    return text
 
 
 def _get_api_key() -> str:
@@ -53,20 +106,6 @@ def generate_content(
     Returns:
         The generated text string, or None if both attempts fail.
     """
-    # Short-circuit: if MOCK_CLAUDE is on in config.json, return a hand-tuned
-    # Shelby-voice fixture instead of hitting the real Anthropic API. This is
-    # how we test for $0 before the client provides a funded API key.
-    from utils.toggle import is_mock_claude
-    from utils.mock_fixtures import select_mock_response
-
-    if is_mock_claude():
-        mock_text = select_mock_response(user_message)
-        logger.info(
-            f"[MOCK_CLAUDE] Returning fixture ({len(mock_text)} chars) — "
-            f"no Anthropic API call made."
-        )
-        return mock_text
-
     api_key = _get_api_key()
 
     headers = {
@@ -97,6 +136,7 @@ def generate_content(
 
             data = response.json()
             text = data["content"][0]["text"]
+            text = _sanitize_output(text)
             logger.info(f"Claude API success — generated {len(text)} characters")
             return text
 

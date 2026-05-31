@@ -93,8 +93,10 @@ Open `config.json` and make sure it reads:
 | **Used for** | Generating all AI content in Shelby's voice |
 | **Where to get** | [console.anthropic.com](https://console.anthropic.com) → API Keys |
 | **Where to put** | `.env` → `ANTHROPIC_API_KEY=...` |
-| **Model used** | `claude-sonnet-4-20250514` |
+| **Model used** | `claude-sonnet-4-6` |
 | **Est. monthly cost** | $5–15/month depending on usage |
+
+> **Model note:** The original spec referenced `claude-sonnet-4-20250514`, which Anthropic's API returns 404 for (it isn't a published model ID). We use the current Sonnet 4.6 alias `claude-sonnet-4-6` instead — same family, newer generation, verified working against the API.
 
 ### 2. Apify API Token
 
@@ -106,20 +108,33 @@ Open `config.json` and make sure it reads:
 | **Actor used** | `cristiantala/skool-all-in-one-api` |
 | **Est. monthly cost** | $10–30/month |
 
-> **Apify Setup:** Log into Apify, search the store for "Skool All-in-One API" by cristiantala, and click "Try for free". The actor uses Shelby's Skool cookies for authentication — set up once during first run.
+> **Apify Setup:** Log into Apify, search the store for "Skool All-in-One API" by cristiantala, and click "Try for free". The first call pays a ~10s Playwright login cost; the actor caches the session internally per run.
 
-### 3. Shelby's Skool User ID
+### 3. Shelby's Skool credentials
+
+The Apify actor logs into Skool as Shelby using email + password (not just a cookie). Both go in `.env`:
+
+| Field | Value |
+|-------|-------|
+| **Used for** | Authenticating Apify calls as Shelby |
+| **Where to put** | `.env` → `SKOOL_EMAIL=...` and `SKOOL_PASSWORD=...` |
+
+### 4. Shelby's Skool User ID
 
 | Field | Value |
 |-------|-------|
 | **Used for** | Filtering out comments Shelby already replied to |
-| **Where to get** | Run `apify_test.py` (below) and look for `createdBy.id` on any post by Shelby |
+| **Where to get** | Call `posts:list` for `class-economy` and look at `author.id` on any post by Shelby |
 | **Where to put** | `.env` → `SHELBY_USER_ID=...` |
 
-**How to find Shelby's User ID:**
-1. Run a test Apify call with action `posts:list` for `class-economy`
-2. In the JSON response, find a post made by Shelby's account
-3. Copy the value from `createdBy.id` — that's her user ID
+### 5. (Optional) Post category
+
+The class-economy group has several Skool categories ("labels"). Daily and weekly posts default to the most-used category. Override if needed:
+
+| Field | Value |
+|-------|-------|
+| **Where to put** | `.env` → `SKOOL_POST_LABEL_ID=...` |
+| **Default** | The 24-post category id baked into [utils/apify_client.py](utils/apify_client.py) |
 
 ---
 
@@ -169,32 +184,66 @@ Open `config.json` and change:
 
 ## Deploying to Railway or Render
 
-### Railway Deployment
+This runs as **one always-on service**. That single process serves the toggle
+dashboard *and* runs the built-in scheduler ([scheduler.py](scheduler.py)) that
+fires the three workflows on time. Because everything lives in one process on
+one filesystem, the toggle dashboard and the workflows share the **same**
+`config.json` — flipping the switch reliably pauses/resumes everything.
 
-1. Push this project to a GitHub repository
-2. Go to [railway.app](https://railway.app) and create a new project from your GitHub repo
-3. Add all environment variables from `.env` in the Railway dashboard (Settings → Variables)
-4. Set up scheduled jobs (Railway Cron) with these schedules:
+The scheduler uses Eastern Time directly, so **daylight saving is handled
+automatically** — there is nothing to adjust twice a year.
 
-| Service | Command | Cron Schedule |
-|---------|---------|---------------|
-| Daily Post | `python daily_post.py` | `0 12 * * *` (7AM ET = 12:00 UTC) |
-| Comment Reply | `python comment_reply.py` | `0 * * * *` |
-| Weekly Events | `python weekly_events.py` | `0 13 * * 1` (8AM ET Mon = 13:00 UTC) |
-| Dashboard | `python dashboard/app.py` | (always running) |
+### Why one service (not separate cron jobs)
 
-> **Timezone Note:** Railway runs in UTC. Eastern Time is UTC-5 (standard) or UTC-4 (daylight saving). Adjust cron accordingly. During daylight saving (March–November): 7AM ET = 11:00 UTC. During standard time (November–March): 7AM ET = 12:00 UTC.
+Platform cron jobs run as separate containers with separate filesystems. A
+toggle written to `config.json` in one container would never be seen by the
+others, so the on/off switch would silently fail. Running the dashboard and
+scheduler together keeps one shared source of truth.
 
-### Render Deployment
+### Step 1 — Push to GitHub
+Push this project to a GitHub repository.
 
-1. Push to GitHub
-2. Create a **Web Service** on [render.com](https://render.com) for the dashboard (`python dashboard/app.py`)
-3. Create **Cron Jobs** for each workflow script using the schedules above
-4. Add environment variables in Render dashboard → Environment
+### Step 2 — Create ONE service
 
----
+| Platform | Service type | Start command |
+|----------|-------------|---------------|
+| **Railway** | Service from repo | `python dashboard/app.py` |
+| **Render**  | **Web Service** (not free tier — see note) | `python dashboard/app.py` |
 
-## Cron Schedule Reference
+> **Render note:** Render's *free* web services sleep after ~15 min of inactivity, which would freeze the scheduler. Use Railway, or a Render **paid** instance, so the service stays awake 24/7.
+
+### Step 3 — Add a persistent volume (so the toggle survives redeploys)
+
+The container filesystem resets on every redeploy. Mount a small volume and
+point the config at it so Shelby's on/off choice (and posting state) persists:
+
+1. Add a volume/disk mounted at `/data` (1 GB is plenty).
+2. Set env var `CONFIG_PATH=/data/config.json`.
+
+On first boot the service auto-creates `/data/config.json` with `SYSTEM_ACTIVE: true`,
+so it goes live immediately.
+
+### Step 4 — Add environment variables
+
+| Variable | Value |
+|----------|-------|
+| `ANTHROPIC_API_KEY` | your Anthropic key |
+| `APIFY_API_TOKEN` | your Apify token |
+| `SKOOL_EMAIL` | Shelby's Skool login email |
+| `SKOOL_PASSWORD` | Shelby's Skool password (used by the Apify actor to log in) |
+| `SHELBY_USER_ID` | Shelby's Skool user ID (her `author.id`) |
+| `CONFIG_PATH` | `/data/config.json` (the mounted volume) |
+| `REPLIED_STORE_PATH` | *(optional)* defaults to `replied_comments.json` next to `config.json`. Set to a volume path (e.g. `/data/replied_comments.json`) so the duplicate-reply guard persists across redeploys. |
+| `SKOOL_POST_LABEL_ID` | *(optional)* override the default Skool category daily/weekly posts go into |
+| `PORT` | provided automatically by Railway/Render |
+
+That's it — the dashboard URL is what you hand to Shelby.
+
+### Local / single-server (cron) alternative
+
+If you ever deploy on a plain VPS where the dashboard and jobs share one disk,
+you can use OS cron instead of the built-in scheduler. Run the dashboard with
+`RUN_SCHEDULER=false` and add these cron lines (Eastern Time — adjust for DST):
 
 ```bash
 # Daily post — 7:00 AM Eastern (UTC-4 during DST, UTC-5 during standard)
@@ -208,6 +257,20 @@ Open `config.json` and change:
 0 12 * * 1   python /path/to/ai-shelby/weekly_events.py  # DST
 0 13 * * 1   python /path/to/ai-shelby/weekly_events.py  # Standard time
 ```
+
+You can also run the scheduler by itself (no dashboard) with `python scheduler.py`.
+
+---
+
+## Go-Live Checklist
+
+- [ ] `.env` (or platform env vars) has `ANTHROPIC_API_KEY`, `APIFY_API_TOKEN`, `SKOOL_EMAIL`, `SKOOL_PASSWORD`, `SHELBY_USER_ID`
+- [ ] `CONFIG_PATH` points at the mounted volume (`/data/config.json`)
+- [ ] `SYSTEM_ACTIVE: true` in the live config (the volume seed does this on first boot)
+- [ ] Service start command is `python dashboard/app.py` with `RUN_SCHEDULER` unset or `true`
+- [ ] Dashboard URL loads and the toggle flips the live state
+- [ ] Service logs show: `Background scheduler started` with three jobs and their next run times
+- [ ] Manual smoke test: run `python comment_reply.py` once and confirm logs show real posts/comments being processed
 
 ---
 
@@ -249,7 +312,7 @@ Before going live, complete every item below:
 → Check `shelby_prompt.py` — the system prompt must be passed exactly as-is to every Claude call.
 
 ### Comment reply posts duplicate replies
-→ Verify `SHELBY_USER_ID` is correct. This ID is how the script detects Shelby's existing replies.
+→ Verify `SHELBY_USER_ID` is correct — it's the first line of defense for detecting Shelby's existing replies. As a backstop, every reply made in live mode is also recorded in `replied_comments.json` (see `REPLIED_STORE_PATH`), so even if Apify is slow to show the new reply, the next hourly run won't reply again. If you ever *want* the bot to re-reply to everything, delete that file. Make sure it lives on the persistent volume so it isn't wiped on redeploy.
 
 ---
 

@@ -36,10 +36,10 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # ── Load shared modules ──────────────────────────────────────
 from shelby_prompt import SHELBY_SYSTEM_PROMPT
-from utils.toggle import is_system_active, is_dry_run
+from utils.toggle import is_system_active
 from utils.claude_client import generate_content
 from utils.apify_client import list_posts, list_comments, create_reply
-from utils.mock_feed import append_community_comment
+from utils import replied_store
 
 # ── Logging Setup ────────────────────────────────────────────
 logging.basicConfig(
@@ -65,7 +65,7 @@ def get_shelby_user_id() -> str:
     if not user_id or user_id == "shelby_skool_user_id_here":
         raise EnvironmentError(
             "SHELBY_USER_ID is not set in .env. "
-            "Run Apify with action 'posts:list' and find Shelby's 'createdBy.id' value."
+            "Run Apify with action 'posts:list' and find Shelby's 'author.id' value."
         )
     return user_id
 
@@ -85,14 +85,14 @@ def has_shelby_replied(comment: dict, shelby_user_id: str) -> bool:
     if not replies:
         return False
     return any(
-        reply.get("createdBy", {}).get("id") == shelby_user_id
+        reply.get("author", {}).get("id") == shelby_user_id
         for reply in replies
     )
 
 
 def is_shelby_comment(comment: dict, shelby_user_id: str) -> bool:
     """Returns True if the comment was written by Shelby herself."""
-    return comment.get("createdBy", {}).get("id") == shelby_user_id
+    return comment.get("author", {}).get("id") == shelby_user_id
 
 
 def build_reply_prompt(comment_body: str) -> str:
@@ -118,7 +118,7 @@ def process_post(post: dict, shelby_user_id: str) -> tuple[int, int]:
         Tuple of (replies_posted, replies_skipped)
     """
     post_id = post.get("id")
-    post_preview = (post.get("body", "") or "")[:60]
+    post_preview = (post.get("content") or post.get("title") or "")[:60]
     logger.info(f"Processing post [{post_id}]: {post_preview!r}...")
 
     # Fetch comments for this post
@@ -127,11 +127,17 @@ def process_post(post: dict, shelby_user_id: str) -> tuple[int, int]:
         logger.info(f"  No comments found for post [{post_id}]")
         return 0, 0
 
-    # Filter to unanswered comments from other users
+    # Filter to unanswered comments from other users.
+    # Three guards: not Shelby's own comment, Shelby hasn't replied in the
+    # thread (per Apify), and we haven't already recorded a reply locally
+    # (replied_store). The local store is the belt-and-suspenders guard for
+    # live mode — it catches the case where Apify hasn't surfaced our new reply
+    # in the `replies` array yet, which would otherwise cause a double reply.
     unanswered = [
         c for c in comments
         if not is_shelby_comment(c, shelby_user_id)
         and not has_shelby_replied(c, shelby_user_id)
+        and not replied_store.has_replied(c.get("id"))
     ]
 
     logger.info(
@@ -143,7 +149,7 @@ def process_post(post: dict, shelby_user_id: str) -> tuple[int, int]:
 
     for comment in unanswered:
         comment_id = comment.get("id")
-        comment_body = comment.get("body", "").strip()
+        comment_body = (comment.get("content") or "").strip()
 
         if not comment_body:
             logger.warning(f"  Skipping comment [{comment_id}] — empty body")
@@ -152,18 +158,6 @@ def process_post(post: dict, shelby_user_id: str) -> tuple[int, int]:
 
         # Determine the root post ID for threading the reply correctly
         root_id = comment.get("rootId") or post_id
-
-        # In dry-run mode, record the community comment we're about to reply
-        # to on the mock feed — gives the feed page context.
-        if is_dry_run():
-            author = comment.get("createdBy", {})
-            append_community_comment(
-                body=comment_body,
-                comment_id=comment_id,
-                root_id=root_id,
-                author_name=author.get("name", "Unknown teacher"),
-                author_id=author.get("id", "unknown"),
-            )
 
         # Generate reply with Claude
         prompt = build_reply_prompt(comment_body)
@@ -182,7 +176,7 @@ def process_post(post: dict, shelby_user_id: str) -> tuple[int, int]:
 
         # Post the reply
         success = create_reply(
-            body=reply_text,
+            content=reply_text,
             root_id=root_id,
             parent_id=comment_id,
         )
@@ -190,6 +184,9 @@ def process_post(post: dict, shelby_user_id: str) -> tuple[int, int]:
         if success:
             logger.info(f"  ✅ Reply posted to comment [{comment_id}]")
             replies_posted += 1
+            # Record the reply so future runs never reply to this comment again,
+            # even if Apify hasn't surfaced our reply in the `replies` array yet.
+            replied_store.mark_replied(comment_id)
         else:
             logger.error(f"  ❌ Failed to post reply to comment [{comment_id}]")
             replies_skipped += 1

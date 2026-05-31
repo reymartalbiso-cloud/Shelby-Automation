@@ -10,10 +10,43 @@ import json
 import os
 import logging
 
-# Path to config.json — always relative to the project root
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
+# Path to config.json. Defaults to the project root, but can be pointed at a
+# mounted volume via the CONFIG_PATH env var. In the combined-service deploy,
+# the dashboard and the scheduled jobs run in ONE process on ONE filesystem,
+# so this single file is the shared source of truth for the on/off toggle.
+# On a host with a persistent volume, set CONFIG_PATH=/data/config.json so the
+# toggle survives redeploys.
+CONFIG_PATH = os.environ.get("CONFIG_PATH") or os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "config.json"
+)
+
+# Default config — matches the client spec exactly: a single SYSTEM_ACTIVE flag.
+DEFAULT_CONFIG = {
+    "SYSTEM_ACTIVE": True,
+}
 
 logger = logging.getLogger(__name__)
+
+
+def ensure_config() -> None:
+    """
+    Creates config.json with safe production defaults if it doesn't exist yet.
+
+    Called once at service startup so a fresh deploy/volume always has a toggle
+    file to read. Existing files are never touched — Shelby's saved on/off state
+    is preserved across restarts.
+    """
+    if os.path.exists(CONFIG_PATH):
+        return
+    try:
+        parent = os.path.dirname(CONFIG_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2)
+        logger.info(f"Seeded new config.json at {CONFIG_PATH} with production defaults.")
+    except Exception as e:
+        logger.error(f"Could not create config.json at {CONFIG_PATH}: {e}")
 
 
 def _read_config() -> dict:
@@ -42,24 +75,6 @@ def is_system_active() -> bool:
     if not active:
         logger.info("System is PAUSED (SYSTEM_ACTIVE = false). Exiting.")
     return bool(active)
-
-
-def is_mock_claude() -> bool:
-    """
-    Reads MOCK_CLAUDE from config.json.
-    When true, claude_client.generate_content returns canned Shelby-voice
-    fixtures instead of calling the real Anthropic API. Useful for $0 testing.
-    """
-    return bool(_read_config().get("MOCK_CLAUDE", False))
-
-
-def is_dry_run() -> bool:
-    """
-    Reads DRY_RUN from config.json.
-    When true, apify_client write functions log what they would have posted
-    and return success without calling Apify. Read functions return mock data.
-    """
-    return bool(_read_config().get("DRY_RUN", False))
 
 
 def set_system_active(value: bool) -> bool:

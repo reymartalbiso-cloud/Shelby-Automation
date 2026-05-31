@@ -67,6 +67,37 @@ def build_user_message(day_of_week: str, content_info: dict) -> str:
     )
 
 
+def derive_title_and_body(generated: str, day_of_week: str) -> tuple[str, str]:
+    """
+    Splits a generated post into a Skool title + body.
+
+    Skool's posts:create requires a title field separately. Shelby's natural
+    posts often open with a short headline-style line; if so we lift that as
+    the title and keep the rest as the body. If there's no obvious break we
+    fall back to the first sentence, then a day-of-week placeholder.
+    """
+    text = (generated or "").strip()
+    if not text:
+        return f"{day_of_week} update", ""
+
+    # Preferred shape: short first line, blank or newline, then the rest.
+    if "\n" in text:
+        first_line, rest = text.split("\n", 1)
+        first_line = first_line.strip()
+        rest = rest.strip()
+        if first_line and len(first_line) <= 100 and rest:
+            return first_line, rest
+
+    # Fallback: take the first sentence as the title, keep full text as body.
+    for end_char in (".", "!", "?"):
+        idx = text.find(end_char)
+        if 0 < idx <= 100:
+            return text[: idx + 1].strip(), text
+
+    # Last resort: a day-flavoured placeholder so the post still goes out.
+    return f"{day_of_week} from Shelby", text
+
+
 def run():
     """Main entry point for Workflow 1: Daily Morning Post."""
 
@@ -106,9 +137,11 @@ def run():
 
     logger.info(f"Generated post ({len(post_text)} chars):\n{'-'*40}\n{post_text}\n{'-'*40}")
 
-    # ── Step 5: Post to Skool via Apify ──────────────────────
+    # ── Step 5: Split into title + body, then post via Apify ─
+    title, body = derive_title_and_body(post_text, day_of_week)
+    logger.info(f"Title: {title!r}")
     logger.info("Posting to Skool community via Apify...")
-    success = create_post(body=post_text, category="general")
+    success = create_post(title=title, content=body)
 
     if success:
         logger.info("✅ Daily post published successfully!")

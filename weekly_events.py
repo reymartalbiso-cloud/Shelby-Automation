@@ -96,37 +96,37 @@ def parse_events(raw_text: str) -> list[dict]:
         return []
 
 
-def format_event_post(event: dict, index: int) -> str:
+def format_event_post(event: dict, index: int) -> tuple[str, str]:
     """
-    Formats a single event dict into a readable Skool post body.
+    Splits one event dict into (Skool title, Skool body).
 
     Args:
         event: Dict with keys: title, description, day_of_week, event_type
         index: Position in the list (1-4) for display
 
     Returns:
-        Formatted post text string.
+        (title, body) — title is short and prefixed with a calendar emoji + index
+        so the four weekly events show up as a numbered set on the feed.
     """
-    title = event.get("title", "This Week's Event").strip()
+    raw_title = event.get("title", "This Week's Event").strip()
     description = event.get("description", "").strip()
     day = event.get("day_of_week", "").strip()
     event_type = event.get("event_type", "").strip()
 
-    # Build the post body
-    lines = [f"📅 Week Event #{index}: {title}"]
+    title = f"📅 Week Event #{index}: {raw_title}"
 
+    # Body lines: event type, when, blank line, then the description
+    body_lines = []
     if event_type:
-        lines.append(f"Type: {event_type.replace('-', ' ').title()}")
-
+        body_lines.append(f"Type: {event_type.replace('-', ' ').title()}")
     if day:
-        lines.append(f"When: {day}")
-
-    lines.append("")  # blank line
-
+        body_lines.append(f"When: {day}")
+    if body_lines:
+        body_lines.append("")
     if description:
-        lines.append(description)
+        body_lines.append(description)
 
-    return "\n".join(lines)
+    return title, "\n".join(body_lines)
 
 
 def run():
@@ -170,11 +170,11 @@ def run():
     failed_count = 0
 
     for i, event in enumerate(events, start=1):
-        post_body = format_event_post(event, i)
-        logger.info(f"Posting event {i}/{len(events)}: {event.get('title', 'Untitled')}")
+        post_title, post_body = format_event_post(event, i)
+        logger.info(f"Posting event {i}/{len(events)}: {post_title}")
         logger.debug(f"Post body:\n{post_body}")
 
-        success = create_post(body=post_body, category="general")
+        success = create_post(title=post_title, content=post_body)
 
         if success:
             logger.info(f"  ✅ Event {i} posted successfully!")
